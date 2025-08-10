@@ -1,0 +1,206 @@
+from collections import deque
+
+# 假设 bodies 是外部定义或预设的
+bodies = ['p1', 'p2', 'p3', 'p4']
+
+# 初始化一次（建议放 onStart）
+track_counts = {b: 0 for b in bodies}
+move_counts  = {b: 0 for b in bodies}
+stored = {
+    'locked_body': None,
+    'lock_counter': 0,
+    'move_flags': {b: deque(maxlen=20) for b in bodies},
+    'last_moving_frames': 20
+}
+
+
+
+def update_lock_state(min_stable_frames, unlock_frames, switch_delta, trigger_ratio,
+                      move_flags, lock_counter, locked_body, bodies):
+    stable_scores = {}
+    for b in bodies:
+        stable_frames = sum([1 if f == 0 else 0 for f in move_flags[b]])
+        stable_scores[b] = stable_frames
+
+    candidates = [b for b in bodies if stable_scores[b] >= min_stable_frames]
+    if not candidates:
+        lock_counter += 1
+        if lock_counter >= unlock_frames:
+            locked_body = None
+            lock_counter = 0
+        return locked_body, lock_counter
+
+    candidates.sort(key=lambda b: stable_scores[b], reverse=True)
+    best_candidate = candidates[0]
+    best_score = stable_scores[best_candidate]
+    current_score = stable_scores.get(locked_body, 0)
+
+    if locked_body is None:
+        locked_body = best_candidate
+        lock_counter = 0
+    elif (best_score - current_score) >= switch_delta and (best_score / min_stable_frames) >= trigger_ratio:
+        locked_body = best_candidate
+        lock_counter = 0
+    else:
+        lock_counter += 1
+
+    return locked_body, lock_counter
+
+
+# ======= onFrameStart 函数 =======
+
+def onFrameStart(frame):
+    global track_counts, move_counts
+
+     # 读取参数
+    param = op('constant1')
+    min_stable_frames = int(param['MinStableFrames'][0])
+    moving_max_frames = int(param['MovingMaxFrames'][0])
+    unlock_frames     = int(param['UnlockFrames'][0])
+    switch_delta      = int(param['SwitchDelta'][0])
+    trigger_ratio     = float(param['TriggerRatio'][0])
+    LR_thresh         = float(param['LR_thresh'][0])
+    dis_min           = float(param['Dis_Min'][0])
+    dis_max           = float(param['Dis_Max'][0])
+
+    # 用于距离归一化
+    Dmax = (LR_thresh**2 + dis_max**2)**0.5
+
+    if moving_max_frames != stored['last_moving_frames']:
+        stored['last_moving_frames'] = moving_max_frames
+        stored['move_flags'] = {b: deque(maxlen=moving_max_frames) for b in bodies}
+
+    move_flags   = stored['move_flags']
+    locked_body  = stored['locked_body']
+    lock_counter = stored['lock_counter']
+
+        # ✅ 状态机调用（你自己的封装函数）
+    locked_body, lock_counter = update_lock_state(
+        min_stable_frames, unlock_frames, switch_delta, trigger_ratio,
+        move_flags, lock_counter, locked_body, bodies
+    )
+
+
+
+    candidates = []
+    debug_info = []
+
+
+    # —— 收集候选并打分 —— 
+    for b in bodies:
+        try:
+            tr = op('select_sklen_filter')[f'{b}:tracked'][0]
+            mv = op('select_sklen_filter')[f'{b}:moving'][0]
+            tx = op('select_sklen_filter')[f'{b}/body/pelvis:tx'][0]
+            tz = op('select_sklen_filter')[f'{b}/body/pelvis:tz'][0]
+            is_in_zone = abs(tx) < LR_thresh and dis_min < abs(tz) < dis_max
+            # 更新稳定帧计数
+            if tr and mv == 0:
+                track_counts[b] = min(track_counts[b] + 1, min_stable_frames)
+            else:
+                track_counts[b] = 0
+
+            # 更新连续移动帧计数,强过滤，条件太够强硬
+            # if mv == 1:
+            #     move_counts[b] = min(move_counts[b] + 1, MOVING_MAX_FRAMES)
+            # else:
+            #     move_counts[b] = 0
+
+            #滑动窗口
+            move_flags[b].append(mv)
+
+            # —— 强过滤 —— 
+            if not tr:
+                debug_info.append(f"{b}: ❌ 未被跟踪")
+                continue
+
+            # 连续多帧移动则排除
+            if move_counts[b] >= moving_max_frames:
+                debug_info.append(f"{b}: ⚠️ 连续移动 {move_counts[b]} 帧，跳过")
+                continue
+
+            if tx is None or tz is None or tx == 0 or tz == 0:
+                debug_info.append(f"{b}: ❌ 无效位置 tx={tx:.2f}, tz={tz:.2f}")
+                continue
+
+            if not is_in_zone:
+                debug_info.append(f"{b}: ❌ 超出范围 tx={tx:.2f}, tz={tz:.2f}")
+                continue
+
+            # —— 计算得分 —— 
+            # 稳定加分、锁定加分、距离归一化加分
+            score = 0
+            if track_counts[b] >= min_stable_frames:
+                score += 2
+            if b == locked_body:
+                score += 5
+            d = (tx**2 + tz**2)**0.5
+            dist_score = max(0, (1 - d / Dmax)) * 3
+            score += dist_score
+
+            candidates.append((b, score))
+            debug_info.append(
+                f"{b}: 得分={score:.2f} "
+                f"[稳定帧={track_counts[b]}, 移动计数={move_counts[b]}, 距离={d:.2f}, 已锁定={b==locked_body}]"
+            )
+
+        except Exception as e:
+            debug_info.append(f"{b}: ⚠️ 异常: {e}")
+
+    # —— 排序并选出最佳候选 —— 
+    candidates.sort(key=lambda x: -x[1])  # 高分优先
+    best_body, best_score = (candidates[0] if candidates else (None, -1))
+    # 当前锁定者的分数
+    current_score = next((s for b, s in candidates if b == locked_body), -1)
+
+    # —— 锁定/切换逻辑 —— 
+    if best_body:
+        if locked_body is None or best_score > current_score + switch_delta:
+            locked_body = best_body
+            lock_counter = 0
+            debug_info.append(f"🔒 新锁定: {locked_body} (得分={best_score:.2f})")
+        else:
+            debug_info.append(f"✅ 保持锁定: {locked_body} (得分={current_score:.2f})")
+    else:
+        debug_info.append("⚠️ 无有效候选")
+
+    # —— 解锁检测 —— 
+    if locked_body:
+        tr = op('select_sklen_filter')[f'{locked_body}:tracked'][0]
+        mv = op('select_sklen_filter')[f'{locked_body}:moving'][0]
+
+        # 锁定者连续移动到达阈值，强制解锁
+        # if move_counts[locked_body] >= MOVING_MAX_FRAMES:
+        #     debug_info.append(f"🔓 解锁 {locked_body}: 连续移动 {move_counts[locked_body]} 帧")
+        #     locked_body = None
+        #     lock_counter = 0
+
+        # 连续移动帧数超过阈值，解锁
+        moving_ratio = sum(move_flags[locked_body])  / moving_max_frames
+        if moving_ratio >= trigger_ratio:
+            debug_info.append(f"🔓 解锁 {locked_body}: 连续移动 {moving_ratio:.2f}")
+            locked_body = None
+            lock_counter = 0
+
+        # 普通失稳解锁
+        elif not tr or mv == 1:
+            lock_counter += 1
+            debug_info.append(f"⚠️ {locked_body} 不稳定, 锁定计数={lock_counter}")
+            if lock_counter > unlock_frames:
+                debug_info.append(f"🔓 解锁 {locked_body}: 超时")
+                locked_body = None
+                lock_counter = 0
+        else:
+            lock_counter = 0
+
+
+
+    # —— 输出 & 调试日志 —— 
+    op('body_selector_table')[0,0] = f'{locked_body}*' if locked_body else '<None>'
+    print("\n".join(debug_info))
+
+    # ✅ 写回状态
+    stored['locked_body']  = locked_body
+    stored['lock_counter'] = lock_counter
+
+    return
