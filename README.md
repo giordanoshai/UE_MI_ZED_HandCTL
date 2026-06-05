@@ -2,13 +2,19 @@
 
 一个用 Python 开发的控制面板，用于协调 **TouchDesigner (TD)**、**Unreal Engine (UE)** 和 **ZED 摄像头**的集成系统。该项目提供了一个图形化界面来管理参数、监控系统状态和控制应用生命周期。
 
+---
+
+**English:** A Python-based control panel for coordinating the integration system of **TouchDesigner (TD)**, **Unreal Engine (UE)**, and **ZED Camera**. This project provides a graphical interface to manage parameters, monitor system status, and control the application lifecycle.
+
+---
+
 ## 🎯 功能特性
 
 - **多应用集成** - 同时启动和管理 TouchDesigner 和 Unreal Engine
 - **实时参数控制** - 通过 UI 获取和设置 TD 参数
 - **心跳监控** - 实时检测 TD/UE 在线状态，支持 OSC 心跳协议
 - **WebSocket 通信** - TD 与 Python 通过 WebSocket 实时通信
-- **系统绑定状态** - 显示 BODY 识别和锁定状态
+- **系统绑定状态** - 显示 BODY 识别和��定状态
 - **日志记录** - 完整的日志系统，支持文件归档
 
 ## 📋 系统要求
